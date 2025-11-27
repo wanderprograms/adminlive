@@ -4,80 +4,139 @@
   <meta charset="UTF-8" />
   <title>User Viewer</title>
   <style>
-    body { font-family: Arial, sans-serif; background:#0f172a; color:#e2e8f0; padding:20px; }
-    #placeholder { padding:20px; border:1px dashed #334155; border-radius:8px; text-align:center; color:#94a3b8; }
-    video { width:100%; max-height:400px; background:#111827; border:1px solid #334155; border-radius:8px; display:none; }
+    body { font-family: Arial, sans-serif; padding: 16px; background: #0f172a; color:#e2e8f0; }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 22px; margin-bottom: 10px; }
+    #placeholder { padding: 16px; border:1px dashed #334155; border-radius:8px; text-align:center; color:#94a3b8; }
+    video { width: 100%; max-height: 420px; background:#111827; border:1px solid #334155; border-radius:8px; display:none; }
+    .log { margin-top: 12px; background:#0b1021; border:1px solid #334155; border-radius:6px; padding:10px; font-family: monospace; white-space: pre-wrap; max-height:200px; overflow:auto; }
   </style>
 </head>
 <body>
+<div class="wrap">
   <h1>User Viewer</h1>
   <div id="placeholder">NO LIVE NOW</div>
   <video id="remoteVideo" autoplay playsinline controls></video>
+  <div class="log" id="log"></div>
+</div>
 
-  <!-- Firebase compat SDK -->
-  <script src="https://www.gstatic.com/firebasejs/10.5.0/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.5.0/firebase-database-compat.js"></script>
+<!-- Firebase compat SDKs (10.5.0) -->
+<script src="https://www.gstatic.com/firebasejs/10.5.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.5.0/firebase-database-compat.js"></script>
 
-  <script>
-    // 🔑 Replace with your Firebase config
-    const firebaseConfig = {
-      apiKey: "AIzaSyBBZxCwywnv_ZVXYezOV8IKG6iKWK5sL10",
+<script>
+  // TODO: Replace with your Firebase config (same as admin)
+  const firebaseConfig = {
+    apiKey: "AIzaSyBBZxCwywnv_ZVXYezOV8IKG6iKWK5sL10",
   authDomain: "studio-ywlo1.firebaseapp.com",
   projectId: "studio-ywlo1",
   storageBucket: "studio-ywlo1.firebasestorage.app",
   messagingSenderId: "791958850921",
   appId: "1:791958850921:web:149be668e7f132e59f41f8"
 };
-    firebase.initializeApp(firebaseConfig);
-    const db = firebase.database();
-    const roomRef = db.ref("/webrtc/globalRoom");
 
-    const remoteVideo = document.getElementById("remoteVideo");
-    const placeholder = document.getElementById("placeholder");
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
 
-    let pc;
+  const roomPath = '/webrtc/globalRoom';
+  const roomRef = db.ref(roomPath);
+  const offerCandidatesRef = roomRef.child('offerCandidates');
+  const answerCandidatesRef = roomRef.child('answerCandidates');
+  const offerRef = roomRef.child('offer');
 
-    function showLive(){
-      placeholder.style.display = "none";
-      remoteVideo.style.display = "block";
+  const remoteVideo = document.getElementById('remoteVideo');
+  const placeholder = document.getElementById('placeholder');
+  const logEl = document.getElementById('log');
+
+  let pc = null;
+  let remoteStream = null;
+  let iceOfferListener = null;
+
+  function log(msg){ logEl.textContent += msg + "\n"; }
+
+  function showLiveUI(isLive){
+    if (isLive) {
+      placeholder.style.display = 'none';
+      remoteVideo.style.display = 'block';
+    } else {
+      remoteVideo.style.display = 'none';
+      placeholder.style.display = 'block';
+      placeholder.textContent = 'NO LIVE NOW';
     }
-    function showNoLive(){
-      remoteVideo.style.display = "none";
-      placeholder.style.display = "block";
-      placeholder.textContent = "NO LIVE NOW";
+  }
+
+  async function attachToLive(){
+    log('Checking for live offer...');
+    const snap = await roomRef.get();
+    const room = snap.val();
+
+    if (!room || !room.offer || !room.isLive) {
+      showLiveUI(false);
+      log('No live found.');
+      return;
     }
 
-    // Listener wokhazikika pa roomRef
-    roomRef.on("value", async snap=>{
-      const room = snap.val();
-      if(room && room.isLive && room.offer){
-        // Admin ali live → pangani peer connection
-        pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+    showLiveUI(true);
+    log('Live found. Preparing viewer peer...');
 
-        pc.ontrack = (event)=>{
-          remoteVideo.srcObject = event.streams[0]; // ✅ video imayikidwa mkati mwa handler
-          showLive();
-        };
+    pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302'] }
+      ]
+    });
 
-        pc.onicecandidate = e=>{
-          if(e.candidate){ roomRef.child("answerCandidates").push(e.candidate.toJSON()); }
-        };
+    // Remote track handler (admin video/audio to user)
+    remoteStream = new MediaStream();
+    remoteVideo.srcObject = remoteStream;
 
-        await pc.setRemoteDescription(new RTCSessionDescription(room.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        await roomRef.child("answer").set(answer);
+    pc.ontrack = (event) => {
+      event.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
+    };
 
-        roomRef.child("offerCandidates").on("child_added", snap=>{
-          const cand = snap.val();
-          if(cand){ pc.addIceCandidate(new RTCIceCandidate(cand)); }
-        });
-      } else {
-        // Palibe live
-        showNoLive();
-        if(pc){ pc.close(); pc=null; }
+    // ICE candidates from user → admin
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        answerCandidatesRef.push(e.candidate.toJSON());
+      }
+    };
+
+    // Set remote description from admin offer
+    const offer = room.offer;
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+    // Create and post answer
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await roomRef.child('answer').set({ type: answer.type, sdp: answer.sdp });
+
+    // Listen for admin ICE candidates
+    iceOfferListener = offerCandidatesRef.on('child_added', (snap) => {
+      const candidate = snap.val();
+      if (candidate) {
+        pc.addIceCandidate(new RTCIceCandidate(candidate));
       }
     });
-  </script>
+
+    log('Viewer attached. Streaming should start shortly.');
+  }
+
+  // Live status listener: if room is removed, show NO LIVE NOW and cleanup
+  roomRef.on('value', (snap) => {
+    const room = snap.val();
+    const isLive = !!(room && room.isLive);
+    if (!isLive) {
+      showLiveUI(false);
+      log('Live ended or not started.');
+      // cleanup viewer PC if any
+      if (pc) {
+        try { pc.close(); } catch {}
+        pc = null;
+      }
+    }
+  });
+
+  // Attempt to attach immediately on load
+  attachToLive();
+</script>
 </body>
 </html>
